@@ -4,7 +4,7 @@
       <text class="head-title">音符库</text>
       <view class="mini-control">
         <text class="mini-label">首拍重音提示</text>
-        <switch checked="{{accentFirstBeat}}" color="#07c160" bindchange="onToggleAccent" />
+        <switch checked="{{accentFirstBeat}}" color="#c97857" bindchange="onToggleAccent" />
       </view>
       <view class="mini-control time-sig">
         <text class="mini-label">拍号</text>
