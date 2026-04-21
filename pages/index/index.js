@@ -104,11 +104,13 @@ Page({
   },
 
   onBpmChange(e) {
+    this.stopPlaybackForUserAction();
     const bpm = Number(e.detail.value);
     this.applyBpmValue(bpm);
   },
 
   onBpmInput(e) {
+    this.stopPlaybackForUserAction();
     const value = (e.detail && e.detail.value) || "";
     this.setData({ bpmInputValue: value });
   },
@@ -149,7 +151,7 @@ Page({
     this.stopPlaybackForUserAction();
     const numeratorIndex = Number(e.detail.value);
     const timeSignatureNumerator = Number(this.data.numeratorOptions[numeratorIndex]);
-    const clearedTracks = this.data.tracks.map((track) => ({ ...track, notes: [] }));
+    const clearedTracks = this.data.tracks.map((track) => Object.assign({}, track, { notes: [] }));
     this.setData({
       numeratorIndex,
       timeSignatureNumerator,
@@ -216,7 +218,7 @@ Page({
   onClearTrack(e) {
     this.stopPlaybackForUserAction();
     const trackId = e.currentTarget.dataset.trackId;
-    const tracks = this.data.tracks.map((track) => (track.id === trackId ? { ...track, notes: [] } : track));
+    const tracks = this.data.tracks.map((track) => (track.id === trackId ? Object.assign({}, track, { notes: [] }) : track));
     this.setData({
       tracks: this.decorateTracksForPlayback(tracks, this.data.playingTrackIndex, this.data.progressPercent / 100, this.data.isPlaying)
     });
@@ -225,7 +227,7 @@ Page({
   onToggleSkipTrack(e) {
     this.stopPlaybackForUserAction();
     const trackId = e.currentTarget.dataset.trackId;
-    const tracks = this.data.tracks.map((track) => (track.id === trackId ? { ...track, skipTrack: !track.skipTrack } : track));
+    const tracks = this.data.tracks.map((track) => (track.id === trackId ? Object.assign({}, track, { skipTrack: !track.skipTrack }) : track));
     this.setData({
       tracks: this.decorateTracksForPlayback(tracks, this.data.playingTrackIndex, this.data.progressPercent / 100, this.data.isPlaying)
     });
@@ -236,7 +238,7 @@ Page({
     const trackId = e.currentTarget.dataset.trackId;
     const tracks = this.data.tracks.map((track) => {
       if (track.id !== trackId) return track;
-      return { ...track, loopCount: Math.max(1, (track.loopCount || 1) - 1) };
+      return Object.assign({}, track, { loopCount: Math.max(1, (track.loopCount || 1) - 1) });
     });
     this.setData({
       tracks: this.decorateTracksForPlayback(tracks, this.data.playingTrackIndex, this.data.progressPercent / 100, this.data.isPlaying)
@@ -248,7 +250,7 @@ Page({
     const trackId = e.currentTarget.dataset.trackId;
     const tracks = this.data.tracks.map((track) => {
       if (track.id !== trackId) return track;
-      return { ...track, loopCount: Math.min(99, (track.loopCount || 1) + 1) };
+      return Object.assign({}, track, { loopCount: Math.min(99, (track.loopCount || 1) + 1) });
     });
     this.setData({
       tracks: this.decorateTracksForPlayback(tracks, this.data.playingTrackIndex, this.data.progressPercent / 100, this.data.isPlaying)
@@ -261,7 +263,7 @@ Page({
     const tracks = this.data.tracks.map((track) => {
       if (track.id !== trackId) return track;
       const notes = track.notes.slice(0, -1);
-      return { ...track, notes };
+      return Object.assign({}, track, { notes });
     });
     this.setData({
       tracks: this.decorateTracksForPlayback(tracks, this.data.playingTrackIndex, this.data.progressPercent / 100, this.data.isPlaying)
@@ -292,7 +294,7 @@ Page({
       symbol: this.getSymbolByDuration(note.duration, !!note.isRest),
       icon: this.getIconByDuration(note.duration, !!note.isRest)
     }));
-    const tracks = this.data.tracks.map((track) => (track.id === activeTrackId ? { ...track, notes } : track));
+    const tracks = this.data.tracks.map((track) => (track.id === activeTrackId ? Object.assign({}, track, { notes }) : track));
     this.setData({
       tracks: this.decorateTracksForPlayback(tracks, this.data.playingTrackIndex, this.data.progressPercent / 100, this.data.isPlaying),
       showPresetPanel: false
@@ -359,7 +361,7 @@ Page({
 
     const tracks = this.data.tracks.map((track) => {
       if (track.id !== this.data.activeTrackId) return track;
-      return { ...track, notes: track.notes.concat(generatedNotes) };
+      return Object.assign({}, track, { notes: track.notes.concat(generatedNotes) });
     });
     this.setData({
       tracks: this.decorateTracksForPlayback(tracks, this.data.playingTrackIndex, this.data.progressPercent / 100, this.data.isPlaying)
@@ -546,17 +548,29 @@ Page({
   },
 
   configureAudioOptions() {
+    if (this.isDevtoolsRuntime()) {
+      return;
+    }
     try {
       wx.setInnerAudioOption({
         mixWithOther: true,
         obeyMuteSwitch: false,
         success: () => {},
         fail: (err) => {
-          console.error("setInnerAudioOption failed", err);
+          console.warn("setInnerAudioOption unavailable in current environment", err);
         }
       });
     } catch (err) {
-      console.error("configureAudioOptions failed", err);
+      console.warn("configureAudioOptions unavailable in current environment", err);
+    }
+  },
+
+  isDevtoolsRuntime() {
+    try {
+      const info = wx.getSystemInfoSync();
+      return info && info.platform === "devtools";
+    } catch (err) {
+      return false;
     }
   },
 
@@ -715,13 +729,12 @@ Page({
             fill = 0;
           }
         }
-        return {
-          ...note,
+        return Object.assign({}, note, {
           _playing: isPlayingNote,
           _fill: Math.max(0, Math.min(100, fill))
-        };
+        });
       });
-      return { ...track, notes };
+      return Object.assign({}, track, { notes });
     });
   },
 
