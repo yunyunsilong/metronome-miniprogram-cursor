@@ -1,0 +1,139 @@
+<view class="page-root">
+  <view class="card palette-card">
+    <view class="palette-head">
+      <text class="head-title">音符库</text>
+      <view class="mini-control">
+        <text class="mini-label">首拍重音提示</text>
+        <switch checked="{{accentFirstBeat}}" color="#07c160" bindchange="onToggleAccent" />
+      </view>
+      <view class="mini-control time-sig">
+        <text class="mini-label">拍号</text>
+        <picker mode="selector" range="{{numeratorOptions}}" value="{{numeratorIndex}}" bindchange="onNumeratorChange">
+          <view class="picker">{{timeSignatureNumerator}}/4</view>
+        </picker>
+      </view>
+      <view class="palette-toggle" bindtap="onTogglePaletteCollapse">
+        <text class="palette-toggle-icon">{{isPaletteCollapsed ? "▾" : "▴"}}</text>
+      </view>
+    </view>
+
+    <view wx:if="{{!isPaletteCollapsed}}" class="tool-grid">
+      <block wx:for="{{tools}}" wx:key="id">
+        <view class="tool-btn {{item.iconSize === 'wide' ? 'tool-btn-combo' : ''}} {{selectedToolId === item.id ? 'tool-btn-active' : ''}}" data-tool-id="{{item.id}}" bindtap="onSelectTool">
+          <image wx:if="{{item.icon}}" class="tool-icon {{item.iconSize === 'wide' ? 'tool-icon-wide-ultra' : ''}}" src="{{item.icon}}" mode="aspectFit" />
+          <text wx:if="{{!item.icon}}" class="tool-symbol">{{item.symbol}}</text>
+          <text class="tool-beat">{{item.beats}}</text>
+        </view>
+      </block>
+    </view>
+    <view wx:else class="palette-collapsed-tip">音符库已收起，点击右侧按钮可展开</view>
+  </view>
+
+  <scroll-view
+    class="page"
+    scroll-y="true"
+    scroll-with-animation="true"
+    scroll-top="{{scrollTop}}"
+    bindscroll="onPageScroll"
+  >
+  <view class="section-title-row">
+    <text class="section-title">音轨（顺序播放）</text>
+    <view class="add-track" bindtap="onAddTrack">+ 添加音轨</view>
+  </view>
+
+  <block wx:for="{{tracks}}" wx:key="id">
+    <view
+      id="track-{{index}}"
+      class="track-card {{item.skipTrack ? 'track-card-skipped' : ''}} {{activeTrackId === item.id && !item.skipTrack ? 'track-card-active' : ''}}"
+      data-track-id="{{item.id}}"
+      bindtap="onSelectTrack"
+    >
+      <view class="track-top">
+        <view class="track-left">
+          <text class="track-name">{{item.name}}</text>
+          <text wx:if="{{playingTrackIndex === index && isPlaying}}" class="playing-tag"></text>
+        </view>
+        <view class="track-ops">
+          <view class="op-btn {{item.skipTrack ? 'op-btn-skip-active' : ''}}" data-track-id="{{item.id}}" catchtap="onToggleSkipTrack">
+            {{item.skipTrack ? "取消跳过" : "跳过此音轨"}}
+          </view>
+          <view class="loop-control">
+            <view class="loop-label">循环次数</view>
+            <view class="loop-box">
+              <view class="loop-op" data-track-id="{{item.id}}" catchtap="onLoopMinus">-</view>
+              <text class="loop-count">{{item.loopCount}}</text>
+              <view class="loop-op" data-track-id="{{item.id}}" catchtap="onLoopPlus">+</view>
+            </view>
+          </view>
+          <view class="op-btn" data-track-id="{{item.id}}" catchtap="onClearTrack">清空</view>
+          <view wx:if="{{tracks.length > 1}}" class="op-btn delete" data-track-id="{{item.id}}" catchtap="onDeleteTrack">删除</view>
+        </view>
+      </view>
+
+      <view class="timeline">
+        <view class="timeline-progress" style="width: {{playingTrackIndex === index && isPlaying ? progressPercent : 0}}%;"></view>
+        <view class="beat-divider" style="left: 25%;"></view>
+        <view class="beat-divider" style="left: 50%;"></view>
+        <view class="beat-divider" style="left: 75%;"></view>
+        <view class="beat-mark">1</view>
+        <view class="beat-mark" style="left: 25%;">2</view>
+        <view class="beat-mark" style="left: 50%;">3</view>
+        <view class="beat-mark" style="left: 75%;">4</view>
+        <block wx:for="{{item.notes}}" wx:key="id">
+          <view class="note-chip {{item.isRest ? 'note-rest' : ''}} {{item._playing ? 'note-playing' : ''}}" style="left: {{item.start * 100}}%; width: {{item.duration * 100}}%;">
+            <view class="note-fill {{item._playing ? 'note-fill-active' : ''}}" style="width: {{item._fill}}%;"></view>
+            <image wx:if="{{item.icon}}" class="note-icon" src="{{item.icon}}" mode="aspectFit" />
+            <text wx:if="{{!item.icon}}" class="note-text">{{item.symbol}}</text>
+          </view>
+        </block>
+      </view>
+    </view>
+  </block>
+
+  <view class="footer-tip">给作者提建议 / 加学习群 +v: nananalalalahahaha</view>
+  </scroll-view>
+</view>
+
+<view class="bottom-bar">
+  <view class="play-btn {{isPlaying ? 'play-btn-stop' : ''}}" bindtap="togglePlay">
+    <image class="play-icon-img" src="{{isPlaying ? '/assets/ui-icons/stop.svg' : '/assets/ui-icons/play.svg'}}" mode="aspectFit" />
+  </view>
+  <view class="bpm-box">
+    <view class="bpm-op" bindtap="onBpmMinus">-</view>
+    <view class="bpm-main">
+      <input
+        class="bpm-num bpm-input"
+        type="number"
+        value="{{bpmInputValue}}"
+        maxlength="3"
+        cursor-spacing="20"
+        bindinput="onBpmInput"
+        bindblur="onBpmInputConfirm"
+        bindconfirm="onBpmInputConfirm"
+      />
+      <text class="bpm-unit">BPM</text>
+    </view>
+    <view class="bpm-op" bindtap="onBpmPlus">+</view>
+  </view>
+  <view class="preset-entry" bindtap="onTogglePresetPanel">
+    <text class="preset-icon">▦</text>
+    <text class="preset-text">节奏预设</text>
+  </view>
+</view>
+
+<view wx:if="{{showPresetPanel}}" class="modal-mask" bindtap="onTogglePresetPanel">
+  <view class="modal" catchtap="noop">
+    <view class="modal-head">
+      <text class="modal-title">选择节奏预设</text>
+      <view class="modal-close" bindtap="onTogglePresetPanel">关闭</view>
+    </view>
+    <scroll-view class="preset-list" scroll-y="true">
+      <block wx:for="{{presets}}" wx:key="id">
+        <view class="preset-item" data-preset-id="{{item.id}}" bindtap="onApplyPreset">
+          <text class="preset-name">{{item.nameZh}}</text>
+          <text class="preset-meta">{{item.notes.length}} 个音符</text>
+        </view>
+      </block>
+    </scroll-view>
+  </view>
+</view>
