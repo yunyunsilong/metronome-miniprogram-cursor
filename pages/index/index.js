@@ -76,19 +76,48 @@ Page({
   _absoluteMeasureIndex: 0,
   _measureDurationMs: 0,
   _playedNoteIdsInMeasure: null,
-  _normalClickPath: "",
-  _accentClickPath: "",
-  _normalAudioPool: null,
-  _accentAudioPool: null,
-  _normalAudioIndex: 0,
-  _accentAudioIndex: 0,
+  _webAudioContext: null,
+  _normalClickBuffer: null,
+  _accentClickBuffer: null,
+  _audioClockBaseMs: 0,
+  _audioClockBaseTime: 0,
+  _lookaheadMs: 100,
+  _minScheduleLeadMs: 12,
+  _audioReady: false,
+  _scheduleMonitorEnabled: false,
+  _leadTimes: null,
+  _leadTimesSize: 50,
+  _leadTimesCount: 0,
+  _leadTimesWriteIndex: 0,
+  _monitorTimer: null,
+  _intervalMonitorEnabled: false,
+  _intervals: null,
+  _intervalsSize: 64,
+  _intervalsCount: 0,
+  _intervalsWriteIndex: 0,
+  _lastScheduledClickMs: null,
+  _intervalWarnThresholdMs: 8,
+  _intervalWarmupRemaining: 0,
   _audioErrorShown: false,
   _lastAutoScrolledTrackIndex: -1,
   _currentScrollTop: 0,
   _viewportHeight: 0,
+  _lastProgressInMeasure: 0,
+  _lastUiUpdateTs: 0,
+  _lastUiBeat: 1,
+  _lastUiTrackIndex: 0,
+  _clockNow: null,
+  _audioPrimed: false,
+  _lastElapsedInMeasureMs: 0,
+  _tickIntervalMs: 8,
+  _nextTickTs: 0,
+  _uiSyncDelayMs: 18,
 
   onLoad() {
+    this._clockNow = this.createClockNow();
+    this.initScheduleMonitor();
     this.configureAudioOptions();
+    this.enableShareCapabilities();
     this.prepareClickSounds();
     this.refreshTrackVisuals(0, 0, false);
     this.resetBeatDots(1);
@@ -97,6 +126,201 @@ Page({
   onUnload() {
     this.stopMetronome();
     this.destroyClickSounds();
+    this.stopScheduleMonitorLogger();
+    this._clockNow = null;
+  },
+
+  initScheduleMonitor() {
+    this._leadTimes = new Array(this._leadTimesSize);
+    this._leadTimesCount = 0;
+    this._leadTimesWriteIndex = 0;
+    this._intervals = new Array(this._intervalsSize);
+    this._intervalsCount = 0;
+    this._intervalsWriteIndex = 0;
+    this._lastScheduledClickMs = null;
+    if (typeof wx !== "undefined") {
+      // Hidden debug switch for on-device troubleshooting.
+      wx.__METRONOME_SET_SCHEDULE_MONITOR__ = (enabled) => {
+        this.setScheduleMonitorEnabled(!!enabled);
+      };
+      wx.__METRONOME_SET_INTERVAL_MONITOR__ = (enabled) => {
+        this.setIntervalMonitorEnabled(!!enabled);
+      };
+    }
+  },
+
+  setScheduleMonitorEnabled(enabled) {
+    this._scheduleMonitorEnabled = !!enabled;
+    if (this._scheduleMonitorEnabled) {
+      this.startScheduleMonitorLogger();
+    } else {
+      this.stopScheduleMonitorLogger();
+    }
+  },
+
+  startScheduleMonitorLogger() {
+    if (this._monitorTimer) return;
+    this._monitorTimer = setInterval(() => {
+      if (!this.data.isPlaying) return;
+      const stats = this.getLeadTimeStats();
+      if (stats) {
+        console.log(
+          `[MetronomeMonitor] leadTime(ms) avg=${stats.avgMs.toFixed(2)} min=${stats.minMs.toFixed(2)} max=${stats.maxMs.toFixed(2)} samples=${stats.samples}`
+        );
+      }
+      if (this._intervalMonitorEnabled) {
+        const intervalStats = this.getIntervalStats();
+        if (intervalStats) {
+          console.log(
+            `[MetronomeMonitor] interval(ms) avg=${intervalStats.avgMs.toFixed(2)} min=${intervalStats.minMs.toFixed(2)} max=${intervalStats.maxMs.toFixed(2)} jitter=${intervalStats.jitterMs.toFixed(2)} samples=${intervalStats.samples}`
+          );
+          if (intervalStats.jitterMs > this._intervalWarnThresholdMs) {
+            console.warn(
+              `[MetronomeMonitor][WARN] jitter ${intervalStats.jitterMs.toFixed(2)}ms exceeded threshold ${this._intervalWarnThresholdMs}ms`
+            );
+          }
+        }
+      }
+    }, 1000);
+  },
+
+  stopScheduleMonitorLogger() {
+    if (!this._monitorTimer) return;
+    clearInterval(this._monitorTimer);
+    this._monitorTimer = null;
+  },
+
+  recordLeadTime(leadTimeMs) {
+    if (!this._leadTimes) return;
+    this._leadTimes[this._leadTimesWriteIndex] = leadTimeMs;
+    this._leadTimesWriteIndex = (this._leadTimesWriteIndex + 1) % this._leadTimesSize;
+    if (this._leadTimesCount < this._leadTimesSize) {
+      this._leadTimesCount += 1;
+    }
+  },
+
+  getLeadTimeStats() {
+    const count = this._leadTimesCount || 0;
+    if (!count || !this._leadTimes) return null;
+    let minMs = Number.POSITIVE_INFINITY;
+    let maxMs = Number.NEGATIVE_INFINITY;
+    let sumMs = 0;
+    for (let i = 0; i < count; i += 1) {
+      const value = this._leadTimes[i];
+      if (typeof value !== "number") continue;
+      if (value < minMs) minMs = value;
+      if (value > maxMs) maxMs = value;
+      sumMs += value;
+    }
+    return {
+      avgMs: sumMs / count,
+      minMs,
+      maxMs,
+      samples: count
+    };
+  },
+
+  setIntervalMonitorEnabled(enabled) {
+    this._intervalMonitorEnabled = !!enabled;
+    if (this._intervalMonitorEnabled) {
+      this.resetIntervalStats(4);
+      this.startScheduleMonitorLogger();
+    }
+  },
+
+  resetIntervalStats(warmupCount) {
+    this._intervalsCount = 0;
+    this._intervalsWriteIndex = 0;
+    this._lastScheduledClickMs = null;
+    this._intervalWarmupRemaining = Math.max(0, warmupCount || 0);
+  },
+
+  recordScheduledInterval(scheduledMs) {
+    if (!this._intervalMonitorEnabled || !Number.isFinite(scheduledMs)) return;
+    if (Number.isFinite(this._lastScheduledClickMs)) {
+      const delta = scheduledMs - this._lastScheduledClickMs;
+      if (delta > 1 && delta < 5000) {
+        if (this._intervalWarmupRemaining > 0) {
+          this._intervalWarmupRemaining -= 1;
+          this._lastScheduledClickMs = scheduledMs;
+          return;
+        }
+        this._intervals[this._intervalsWriteIndex] = delta;
+        this._intervalsWriteIndex = (this._intervalsWriteIndex + 1) % this._intervalsSize;
+        if (this._intervalsCount < this._intervalsSize) {
+          this._intervalsCount += 1;
+        }
+      }
+    }
+    this._lastScheduledClickMs = scheduledMs;
+  },
+
+  getIntervalStats() {
+    const count = this._intervalsCount || 0;
+    if (!count || !this._intervals) return null;
+    let minMs = Number.POSITIVE_INFINITY;
+    let maxMs = Number.NEGATIVE_INFINITY;
+    let sumMs = 0;
+    for (let i = 0; i < count; i += 1) {
+      const value = this._intervals[i];
+      if (typeof value !== "number") continue;
+      if (value < minMs) minMs = value;
+      if (value > maxMs) maxMs = value;
+      sumMs += value;
+    }
+    const avgMs = sumMs / count;
+    return {
+      avgMs,
+      minMs,
+      maxMs,
+      jitterMs: maxMs - minMs,
+      samples: count
+    };
+  },
+
+  createClockNow() {
+    try {
+      if (wx.getPerformance) {
+        const perf = wx.getPerformance();
+        if (perf && typeof perf.now === "function") {
+          const base = Date.now();
+          return () => base + perf.now();
+        }
+      }
+    } catch (err) {}
+    return () => Date.now();
+  },
+
+  nowMs() {
+    if (!this._clockNow) {
+      this._clockNow = this.createClockNow();
+    }
+    return this._clockNow();
+  },
+
+  enableShareCapabilities() {
+    if (!wx.showShareMenu) return;
+    try {
+      wx.showShareMenu({
+        menus: ["shareAppMessage", "shareTimeline"]
+      });
+    } catch (err) {
+      console.warn("showShareMenu failed", err);
+    }
+  },
+
+  onShareAppMessage() {
+    return {
+      title: "自由节拍器 - 可自定义音轨与节奏",
+      path: "/pages/index/index"
+    };
+  },
+
+  onShareTimeline() {
+    return {
+      title: "自由节拍器 - 可自定义音轨与节奏",
+      query: ""
+    };
   },
 
   stopPlaybackForUserAction() {
@@ -128,6 +352,10 @@ Page({
 
   applyBpmValue(nextBpm) {
     const bpm = Math.max(20, Math.min(300, Math.round(nextBpm)));
+    if (bpm !== this.data.bpm && this._intervalMonitorEnabled) {
+      // Avoid false jitter alarms when mixing pre/post BPM intervals.
+      this.resetIntervalStats(4);
+    }
     this.setData({
       bpm,
       bpmInputValue: String(bpm)
@@ -412,11 +640,33 @@ Page({
   },
 
   startMetronome() {
+    if (!this._audioReady || !this._normalClickBuffer || !this._accentClickBuffer) {
+      wx.showToast({
+        title: "声音采样加载中",
+        icon: "none",
+        duration: 1000
+      });
+      return;
+    }
+    const startDelayMs = this.ensureAudioPrimedBeforeStart();
+    if (this._webAudioContext && typeof this._webAudioContext.resume === "function") {
+      try {
+        this._webAudioContext.resume();
+      } catch (err) {}
+    }
+    this._audioClockBaseMs = this.nowMs();
+    this._audioClockBaseTime = this._webAudioContext ? this._webAudioContext.currentTime || 0 : 0;
     this._absoluteMeasureIndex = 0;
-    this._measureStartTs = Date.now();
+    this._measureStartTs = this.nowMs() + startDelayMs;
     this._measureDurationMs = this.getMeasureDurationMs();
     this._playedNoteIdsInMeasure = {};
+    this._lastProgressInMeasure = 0;
+    this._lastElapsedInMeasureMs = 0;
+    this._lastUiUpdateTs = 0;
+    this._lastUiBeat = 1;
+    this._nextTickTs = this._measureStartTs;
     const firstTrackIndex = this.getTrackInfoForMeasure(0).trackIndex;
+    this._lastUiTrackIndex = firstTrackIndex;
     this._lastAutoScrolledTrackIndex = -1;
     this.setData({
       isPlaying: true,
@@ -427,6 +677,7 @@ Page({
     });
     this.resetBeatDots(1);
     this.scrollToPlayingTrack(firstTrackIndex);
+    this.scheduleMeasureDownbeat(this._absoluteMeasureIndex, this._measureStartTs, this._measureDurationMs);
     this.scheduleLoop();
   },
 
@@ -436,6 +687,13 @@ Page({
       this._ticker = null;
     }
     this._lastAutoScrolledTrackIndex = -1;
+    this._lastProgressInMeasure = 0;
+    this._lastElapsedInMeasureMs = 0;
+    this._lastUiUpdateTs = 0;
+    this._lastUiBeat = 1;
+    this._lastUiTrackIndex = 0;
+    this._nextTickTs = 0;
+    this.resetIntervalStats(0);
     this.setData({
       isPlaying: false,
       currentBeat: 1,
@@ -453,178 +711,304 @@ Page({
 
   scheduleLoop() {
     if (!this.data.isPlaying) return;
-    const now = Date.now();
-    const elapsed = now - this._measureStartTs;
-    const progress = Math.max(0, Math.min(1, elapsed / this._measureDurationMs));
+    const now = this.nowMs();
+    let elapsed = now - this._measureStartTs;
+    if (elapsed < 0) {
+      const waitMs = Math.max(1, Math.ceil(-elapsed));
+      this._ticker = setTimeout(() => this.scheduleLoop(), waitMs);
+      return;
+    }
+
+    // Keep a fixed time axis by incrementing measure start with duration
+    // instead of resetting to "now", which can import timer jitter.
+    while (elapsed >= this._measureDurationMs) {
+      const finishingTrackInfo = this.getTrackInfoForMeasure(this._absoluteMeasureIndex);
+      const finishingTrack = this.data.tracks[finishingTrackInfo.trackIndex];
+      this.triggerNotes(finishingTrack, this._lastElapsedInMeasureMs, this._measureDurationMs, this._measureDurationMs);
+
+      this._absoluteMeasureIndex += 1;
+      this._measureStartTs += this._measureDurationMs;
+      this._measureDurationMs = this.getMeasureDurationMs();
+      this._playedNoteIdsInMeasure = {};
+      this._lastProgressInMeasure = 0;
+      this._lastElapsedInMeasureMs = 0;
+      this.scheduleMeasureDownbeat(this._absoluteMeasureIndex, this._measureStartTs, this._measureDurationMs);
+      elapsed = now - this._measureStartTs;
+    }
+
+    // Keep audio scheduling untouched; only delay UI timeline slightly so
+    // visual beat aligns with actual audible onset on real devices.
+    const uiElapsed = Math.max(0, elapsed - this._uiSyncDelayMs);
+    const progress = Math.max(0, Math.min(1, uiElapsed / this._measureDurationMs));
     const trackInfo = this.getTrackInfoForMeasure(this._absoluteMeasureIndex);
     const track = this.data.tracks[trackInfo.trackIndex];
     const currentBeat = Math.min(this.data.timeSignatureNumerator, Math.floor(progress * this.data.timeSignatureNumerator) + 1);
-    this.triggerNotes(track, progress);
+    const windowStart = Math.max(0, Math.min(this._measureDurationMs, this._lastElapsedInMeasureMs));
+    const windowEnd = Math.min(this._measureDurationMs, Math.max(elapsed, windowStart) + this._lookaheadMs);
+    this.triggerNotes(track, windowStart, windowEnd, this._measureDurationMs);
+    this._lastProgressInMeasure = progress;
+    this._lastElapsedInMeasureMs = elapsed;
 
-    this.setData({
-      progressPercent: Math.floor(progress * 100),
-      playingTrackIndex: trackInfo.trackIndex,
-      currentBeat,
-      tracks: this.decorateTracksForPlayback(this.data.tracks, trackInfo.trackIndex, progress, true)
-    });
-    this.scrollToPlayingTrack(trackInfo.trackIndex);
-    this.resetBeatDots(currentBeat);
+    const shouldRenderUi =
+      now - this._lastUiUpdateTs >= 33 ||
+      this._lastUiTrackIndex !== trackInfo.trackIndex ||
+      this._lastUiBeat !== currentBeat;
 
-    if (elapsed >= this._measureDurationMs) {
-      this._absoluteMeasureIndex += 1;
-      this._measureStartTs = now;
-      this._measureDurationMs = this.getMeasureDurationMs();
-      this._playedNoteIdsInMeasure = {};
-      const nextTrackInfo = this.getTrackInfoForMeasure(this._absoluteMeasureIndex);
+    if (shouldRenderUi) {
+      this._lastUiUpdateTs = now;
+      this._lastUiTrackIndex = trackInfo.trackIndex;
+      this._lastUiBeat = currentBeat;
       this.setData({
-        playingTrackIndex: nextTrackInfo.trackIndex,
-        progressPercent: 0,
-        currentBeat: 1,
-        tracks: this.decorateTracksForPlayback(this.data.tracks, nextTrackInfo.trackIndex, 0, true)
+        progressPercent: Math.floor(progress * 100),
+        playingTrackIndex: trackInfo.trackIndex,
+        currentBeat,
+        tracks: this.decorateTracksForPlayback(this.data.tracks, trackInfo.trackIndex, progress, true)
       });
-      this.scrollToPlayingTrack(nextTrackInfo.trackIndex);
-      this.resetBeatDots(1);
+      this.scrollToPlayingTrack(trackInfo.trackIndex);
+      this.resetBeatDots(currentBeat);
     }
 
-    this._ticker = setTimeout(() => this.scheduleLoop(), 25);
+    if (!this._nextTickTs) {
+      this._nextTickTs = now + this._tickIntervalMs;
+    }
+    while (this._nextTickTs <= now) {
+      this._nextTickTs += this._tickIntervalMs;
+    }
+    const nextDelay = Math.max(1, Math.round(this._nextTickTs - now));
+    this._ticker = setTimeout(() => this.scheduleLoop(), nextDelay);
   },
 
-  triggerNotes(track, progress) {
+  ensureAudioPrimedBeforeStart() {
+    if (this._audioPrimed) return 0;
+    if (!this._webAudioContext || !this._normalClickBuffer || !this._accentClickBuffer) {
+      return 0;
+    }
+    this._audioPrimed = true;
+    return 20;
+  },
+
+  triggerNotes(track, fromElapsedMs, toElapsedMs, measureDurationMs) {
     if (!track || !track.notes || !this._playedNoteIdsInMeasure) return;
+    if (!Number.isFinite(measureDurationMs) || measureDurationMs <= 0) return;
+    const start = Math.max(0, fromElapsedMs || 0);
+    const end = Math.max(start, Math.min(measureDurationMs || 0, toElapsedMs || 0));
     for (let i = 0; i < track.notes.length; i += 1) {
       const note = track.notes[i];
       if (note.isRest) continue;
-      if (progress + 0.003 < note.start) continue;
+      const noteAtMs = note.start * measureDurationMs;
+      if (!Number.isFinite(noteAtMs)) continue;
+      if (noteAtMs > end + 1 || noteAtMs < start - 1) continue;
       if (this._playedNoteIdsInMeasure[note.id]) continue;
       this._playedNoteIdsInMeasure[note.id] = true;
       const isAccent = this.data.accentFirstBeat && Math.abs(note.start) < 0.001;
-      this.playClick(isAccent);
+      this.playClick(isAccent, this._measureStartTs + noteAtMs);
     }
   },
 
-  playClick(isAccent) {
-    const pool = isAccent ? this._accentAudioPool : this._normalAudioPool;
-    if (!pool || !pool.length) return;
-    const indexKey = isAccent ? "_accentAudioIndex" : "_normalAudioIndex";
-    const currentIndex = this[indexKey] || 0;
-    const audio = pool[currentIndex % pool.length];
-    this[indexKey] = (currentIndex + 1) % pool.length;
+  playClick(isAccent, scheduledMs) {
+    if (!this._webAudioContext) return;
+    const buffer = isAccent ? this._accentClickBuffer : this._normalClickBuffer;
+    if (!buffer) return;
     try {
-      // Try replay from the beginning without rebuilding context.
-      audio.seek(0);
-      audio.play();
+      const source = this._webAudioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(this._webAudioContext.destination);
+      const currentTime = this._webAudioContext.currentTime;
+      if (!Number.isFinite(currentTime)) return;
+      const leadSec = Number.isFinite(this._minScheduleLeadMs) ? this._minScheduleLeadMs / 1000 : 0.012;
+
+      // Start with a guaranteed-valid near-future time.
+      let when = currentTime + leadSec;
+      if (!Number.isFinite(when)) return;
+
+      // Try mapping the scheduled ms into audio timeline.
+      const mappedAudioTime = this.toAudioTime(scheduledMs);
+      if (Number.isFinite(mappedAudioTime) && mappedAudioTime > when) {
+        when = mappedAudioTime;
+      } else if (!Number.isFinite(mappedAudioTime)) {
+        // Repair timeline mapping when inputs are invalid.
+        this._audioClockBaseMs = this.nowMs();
+        this._audioClockBaseTime = currentTime;
+      }
+
+      if (!Number.isFinite(when)) return;
+      if (this._scheduleMonitorEnabled) {
+        this.recordLeadTime((when - currentTime) * 1000);
+      }
+      this.recordScheduledInterval(scheduledMs);
+      source.start(when);
     } catch (err) {
       console.error("playClick failed", err);
       this.showAudioErrorHint();
     }
   },
 
-  prepareClickSounds() {
-    try {
-      const fs = wx.getFileSystemManager();
-      const baseDir = `${wx.env.USER_DATA_PATH}/metronome`;
-      const normalPath = `${baseDir}/click-normal.wav`;
-      const accentPath = `${baseDir}/click-accent.wav`;
-      try {
-        fs.mkdirSync(baseDir, true);
-      } catch (err) {
-        // Directory may already exist
-      }
+  scheduleMeasureDownbeat(measureIndex, measureStartTs, measureDurationMs) {
+    if (!this._playedNoteIdsInMeasure) return;
+    const trackInfo = this.getTrackInfoForMeasure(measureIndex);
+    const track = this.data.tracks[trackInfo.trackIndex];
+    if (!track || !track.notes || !track.notes.length) return;
+    for (let i = 0; i < track.notes.length; i += 1) {
+      const note = track.notes[i];
+      if (note.isRest) continue;
+      if (note.start > 0.001) continue;
+      if (this._playedNoteIdsInMeasure[note.id]) continue;
+      this._playedNoteIdsInMeasure[note.id] = true;
+      const scheduledMs = measureStartTs + note.start * measureDurationMs;
+      const isAccent = this.data.accentFirstBeat;
+      this.playClick(isAccent, scheduledMs);
+    }
+  },
 
-      // Use longer click samples so real phone speakers can reproduce clearly.
-      this.ensureWavFile(fs, normalPath, 980, 95);
-      this.ensureWavFile(fs, accentPath, 1560, 120);
-      this._normalClickPath = normalPath;
-      this._accentClickPath = accentPath;
-      // A small audio pool avoids stutter on real phones at higher BPM.
-      this._normalAudioPool = this.createClickAudioPool(normalPath, 6);
-      this._accentAudioPool = this.createClickAudioPool(accentPath, 4);
-      this._normalAudioIndex = 0;
-      this._accentAudioIndex = 0;
-    } catch (err) {
+  prepareClickSounds() {
+    this._audioReady = false;
+    const bootstrap = async () => {
+      if (!wx.createWebAudioContext) {
+        throw new Error("createWebAudioContext unavailable");
+      }
+      this._webAudioContext = wx.createWebAudioContext();
+      const loaded = await this.loadClickSampleBuffers(this._webAudioContext);
+      if (!loaded) {
+        // Fallback to synthesized click buffers when sample files are unavailable.
+        this._normalClickBuffer = this.createClickBuffer(this._webAudioContext, {
+          carrierHz: 1200,
+          durationMs: 60,
+          modulationRatio: 2.14,
+          modulationIndexMax: 2.5,
+          peakGain: 0.5
+        });
+        this._accentClickBuffer = this.createClickBuffer(this._webAudioContext, {
+          carrierHz: 1600,
+          durationMs: 60,
+          modulationRatio: 2.14,
+          modulationIndexMax: 5.5,
+          peakGain: 1.0
+        });
+      }
+      this._audioClockBaseMs = this.nowMs();
+      this._audioClockBaseTime = this._webAudioContext.currentTime || 0;
+      this._audioReady = true;
+    };
+    bootstrap().catch((err) => {
       console.error("prepareClickSounds failed", err);
       this.showAudioErrorHint();
+    });
+  },
+
+  async loadClickSampleBuffers(context) {
+    const normalCandidates = [
+      "/assets/audio/normal-click.wav",
+      "assets/audio/normal-click.wav",
+      "/assets/audio/normal-click.mp3",
+      "assets/audio/normal-click.mp3"
+    ];
+    const accentCandidates = [
+      "/assets/audio/accent-click.wav",
+      "assets/audio/accent-click.wav",
+      "/assets/audio/accent-click.mp3",
+      "assets/audio/accent-click.mp3"
+    ];
+    const normalBuffer = await this.tryLoadBufferFromCandidates(context, normalCandidates);
+    const accentBuffer = await this.tryLoadBufferFromCandidates(context, accentCandidates);
+    if (!normalBuffer || !accentBuffer) return false;
+    this._normalClickBuffer = normalBuffer;
+    this._accentClickBuffer = accentBuffer;
+    return true;
+  },
+
+  async tryLoadBufferFromCandidates(context, candidates) {
+    for (let i = 0; i < candidates.length; i += 1) {
+      const buffer = await this.loadAudioBufferFromPath(context, candidates[i]);
+      if (buffer) return buffer;
+    }
+    return null;
+  },
+
+  async loadAudioBufferFromPath(context, filePath) {
+    try {
+      const fs = wx.getFileSystemManager();
+      const arrayBuffer = await new Promise((resolve, reject) => {
+        fs.readFile({
+          filePath,
+          success: (res) => resolve(res.data),
+          fail: (err) => reject(err)
+        });
+      });
+      return await this.decodeAudioDataCompat(context, arrayBuffer);
+    } catch (err) {
+      return null;
+    }
+  },
+
+  async decodeAudioDataCompat(context, arrayBuffer) {
+    try {
+      const maybePromise = context.decodeAudioData(arrayBuffer);
+      if (maybePromise && typeof maybePromise.then === "function") {
+        return await maybePromise;
+      }
+      return await new Promise((resolve, reject) => {
+        context.decodeAudioData(arrayBuffer, resolve, reject);
+      });
+    } catch (err) {
+      return null;
     }
   },
 
   configureAudioOptions() {
-    if (this.isDevtoolsRuntime()) {
-      return;
-    }
-    try {
-      wx.setInnerAudioOption({
-        mixWithOther: true,
-        obeyMuteSwitch: false,
-        success: () => {},
-        fail: (err) => {
-          console.warn("setInnerAudioOption unavailable in current environment", err);
-        }
-      });
-    } catch (err) {
-      console.warn("configureAudioOptions unavailable in current environment", err);
-    }
+    // WebAudio scheduling is used for stable click timing; no InnerAudio options needed.
   },
 
-  isDevtoolsRuntime() {
-    try {
-      const info = wx.getSystemInfoSync();
-      return info && info.platform === "devtools";
-    } catch (err) {
-      return false;
+  createClickBuffer(context, options) {
+    const carrierHz = options.carrierHz;
+    const durationMs = options.durationMs;
+    const modulationRatio = options.modulationRatio;
+    const modulationIndexMax = options.modulationIndexMax;
+    const peakGain = options.peakGain || 0.9;
+    const sampleRate = 44100;
+    const numSamples = Math.floor((sampleRate * durationMs) / 1000);
+    const buffer = context.createBuffer(1, numSamples, sampleRate);
+    const channel = buffer.getChannelData(0);
+    const attackSamples = Math.max(1, Math.floor(sampleRate * 0.003)); // 3ms attack
+    const modulatorHz = carrierHz * modulationRatio;
+    const ampDecayK = 12.0; // immediate post-attack decay
+    const modDecayK = 9.0; // immediate index decay
+
+    for (let i = 0; i < numSamples; i += 1) {
+      const t = i / sampleRate;
+      const attack = i < attackSamples ? i / attackSamples : 1;
+      const decayProgress = i <= attackSamples ? 0 : (i - attackSamples) / Math.max(1, numSamples - attackSamples);
+      const mainEnvelope = i < attackSamples
+        ? peakGain * attack
+        : peakGain * Math.exp(-ampDecayK * decayProgress);
+      const currentIndex = modulationIndexMax * Math.exp(-modDecayK * (i / Math.max(1, numSamples - 1)));
+
+      const modulator = Math.sin(2 * Math.PI * modulatorHz * t) * currentIndex;
+      const sample = Math.sin(2 * Math.PI * carrierHz * t + modulator) * mainEnvelope;
+      channel[i] = Math.max(-1, Math.min(1, sample));
     }
+    return buffer;
   },
 
-  ensureWavFile(fs, path, frequency, durationMs) {
-    let exists = true;
-    try {
-      fs.accessSync(path);
-    } catch (err) {
-      exists = false;
+  toAudioTime(scheduledMs) {
+    if (!Number.isFinite(scheduledMs)) return Number.NaN;
+    if (!Number.isFinite(this._audioClockBaseMs) || !Number.isFinite(this._audioClockBaseTime)) {
+      return Number.NaN;
     }
-    if (exists) return;
-    const wav = this.buildSineWav(frequency, durationMs);
-    try {
-      // Most real devices accept ArrayBuffer directly.
-      fs.writeFileSync(path, wav);
-    } catch (err) {
-      // Fallback for some runtimes that are picky about binary type.
-      fs.writeFileSync(path, new Uint8Array(wav));
-    }
-  },
-
-  createClickAudioPool(src, count) {
-    const pool = [];
-    for (let i = 0; i < count; i += 1) {
-      const audio = wx.createInnerAudioContext();
-      audio.src = src;
-      audio.volume = 1.0;
-      audio.autoplay = false;
-      audio.loop = false;
-      audio.obeyMuteSwitch = false;
-      audio.onError((err) => {
-        console.error("audio onError", err);
-        this.showAudioErrorHint();
-      });
-      pool.push(audio);
-    }
-    return pool;
+    return this._audioClockBaseTime + (scheduledMs - this._audioClockBaseMs) / 1000;
   },
 
   destroyClickSounds() {
-    const destroyPool = (pool) => {
-      if (!pool || !pool.length) return;
-      for (let i = 0; i < pool.length; i += 1) {
-        try {
-          pool[i].destroy();
-        } catch (err) {}
-      }
-    };
-    destroyPool(this._normalAudioPool);
-    destroyPool(this._accentAudioPool);
-    this._normalAudioPool = null;
-    this._accentAudioPool = null;
-    this._normalAudioIndex = 0;
-    this._accentAudioIndex = 0;
+    this._audioReady = false;
+    this._normalClickBuffer = null;
+    this._accentClickBuffer = null;
+    if (this._webAudioContext && typeof this._webAudioContext.close === "function") {
+      try {
+        this._webAudioContext.close();
+      } catch (err) {}
+    }
+    this._webAudioContext = null;
+    this._audioClockBaseMs = 0;
+    this._audioClockBaseTime = 0;
   },
 
   showAudioErrorHint() {
@@ -635,49 +1019,6 @@ Page({
       icon: "none",
       duration: 1800
     });
-  },
-
-  buildSineWav(frequency, durationMs) {
-    // 44.1kHz is broadly compatible on real devices.
-    const sampleRate = 44100;
-    const numChannels = 1;
-    const bitsPerSample = 16;
-    const numSamples = Math.floor((sampleRate * durationMs) / 1000);
-    const dataSize = numSamples * numChannels * (bitsPerSample / 8);
-    const buffer = new ArrayBuffer(44 + dataSize);
-    const view = new DataView(buffer);
-
-    this.writeAscii(view, 0, "RIFF");
-    view.setUint32(4, 36 + dataSize, true);
-    this.writeAscii(view, 8, "WAVE");
-    this.writeAscii(view, 12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, numChannels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * numChannels * (bitsPerSample / 8), true);
-    view.setUint16(32, numChannels * (bitsPerSample / 8), true);
-    view.setUint16(34, bitsPerSample, true);
-    this.writeAscii(view, 36, "data");
-    view.setUint32(40, dataSize, true);
-
-    const fadeOutStart = Math.floor(numSamples * 0.72);
-    for (let i = 0; i < numSamples; i += 1) {
-      const t = i / sampleRate;
-      const base = Math.sin(2 * Math.PI * frequency * t);
-      const env = i < 20 ? i / 20 : 1;
-      const decay = i > fadeOutStart ? Math.max(0, (numSamples - i) / (numSamples - fadeOutStart)) : 1;
-      const overtone = Math.sin(2 * Math.PI * frequency * 2 * t) * 0.25;
-      const sample = Math.max(-1, Math.min(1, (base + overtone) * env * decay * 0.88));
-      view.setInt16(44 + i * 2, sample * 32767, true);
-    }
-    return buffer;
-  },
-
-  writeAscii(view, offset, str) {
-    for (let i = 0; i < str.length; i += 1) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
   },
 
   onPageScroll(e) {

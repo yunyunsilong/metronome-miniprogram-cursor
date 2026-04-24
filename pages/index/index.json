@@ -1,3 +1,5 @@
 {
-  "navigationBarTitleText": "自由节拍器"
+  "navigationBarTitleText": "自由节拍器",
+  "enableShareAppMessage": true,
+  "enableShareTimeline": true
 }
